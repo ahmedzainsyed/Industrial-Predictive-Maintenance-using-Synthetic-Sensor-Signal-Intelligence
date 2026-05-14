@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "industrial-predictive-maintenance"
+version = "1.0.0"
+description = "Industrial Predictive Maintenance Platform using Synthetic Sensor Signal Intelligence"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Industrial PM Team" }]
+keywords = ["predictive-maintenance", "signal-processing", "deep-learning", "industrial-ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests", "signal_processing/tests", "ml/tests"]
+asyncio_mode = "auto"
+markers = [
+    "signal: Signal processing tests",
+    "model: AI model tests",
+    "integration: Integration tests",
+    "api: API endpoint tests",
+    "streaming: Streaming tests",
+]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::UserWarning"]
+timeout = 120
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+include = '\.pyi?$'
+extend-exclude = "migrations/"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["app", "signal_processing", "ml", "digital_twin", "streaming", "mlops"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+allow_untyped_decorators = true
+exclude = ["tests/", "migrations/", "docs/"]
+
+[tool.coverage.run]
+source = ["backend/app", "signal_processing", "ml"]
+omit = ["*/tests/*", "*/migrations/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", "migrations"]
+skips = ["B101", "B601"]

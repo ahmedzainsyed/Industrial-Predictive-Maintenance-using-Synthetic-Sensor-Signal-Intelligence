@@ -1,0 +1,328 @@
+version: "3.9"
+
+x-common-env: &common-env
+  DATABASE_URL: postgresql+asyncpg://pmuser:pmpassword@postgres:5432/predictive_maintenance
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MQTT_BROKER_HOST: mosquitto
+  MQTT_BROKER_PORT: "1883"
+  SECRET_KEY: "change-this-in-production-use-openssl-rand-hex-32"
+  LOG_LEVEL: INFO
+  MODEL_DEVICE: cpu
+  SAMPLING_RATE_HZ: "20000"
+  FFT_WINDOW_SIZE: "1024"
+  WAVELET_FAMILY: db8
+  MC_DROPOUT_SAMPLES: "50"
+
+services:
+  # ─────────────────────────────────────────────
+  # Core Infrastructure
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pm_postgres
+    environment:
+      POSTGRES_USER: pmuser
+      POSTGRES_PASSWORD: pmpassword
+      POSTGRES_DB: predictive_maintenance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pmuser -d predictive_maintenance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pm_network
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: pm_redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pm_network
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: pm_mosquitto
+    volumes:
+      - ./infrastructure/docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_logs:/mosquitto/log
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    networks:
+      - pm_network
+
+  # ─────────────────────────────────────────────
+  # Backend API Service
+  # ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: pm_backend
+    environment:
+      <<: *common-env
+    volumes:
+      - model_artifacts:/app/artifacts
+      - ./backend/app:/app/app:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Celery Workers
+  # ─────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: pm_celery_worker
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4 -Q default,inference,signal_processing
+    environment:
+      <<: *common-env
+    volumes:
+      - model_artifacts:/app/artifacts
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: pm_celery_beat
+    command: celery -A app.tasks.celery_app beat --loglevel=info --scheduler redbeat.RedBeatScheduler
+    environment:
+      <<: *common-env
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: pm_flower
+    command: celery -A app.tasks.celery_app flower --port=5555
+    environment:
+      <<: *common-env
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - pm_network
+
+  # ─────────────────────────────────────────────
+  # Digital Twin & Streaming Engine
+  # ─────────────────────────────────────────────
+  digital_twin:
+    build:
+      context: ./digital_twin
+      dockerfile: Dockerfile
+    container_name: pm_digital_twin
+    environment:
+      <<: *common-env
+      TWIN_UPDATE_INTERVAL_MS: "100"
+      SIMULATION_SPEED: "1.0"
+    ports:
+      - "8002:8002"
+    depends_on:
+      - mosquitto
+      - redis
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  streaming_engine:
+    build:
+      context: ./streaming
+      dockerfile: Dockerfile
+    container_name: pm_streaming
+    environment:
+      <<: *common-env
+      STREAM_BUFFER_SIZE: "10000"
+      ANOMALY_DETECTION_WINDOW: "50"
+    ports:
+      - "8003:8003"
+    depends_on:
+      - mosquitto
+      - redis
+      - backend
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Frontend Dashboard
+  # ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000/api/v1
+        VITE_WS_URL: ws://localhost:8000/ws
+        VITE_TWIN_URL: ws://localhost:8002/ws
+    container_name: pm_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # MLOps Stack
+  # ─────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.1
+    container_name: pm_mlflow
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://pmuser:pmpassword@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    environment:
+      MLFLOW_TRACKING_USERNAME: admin
+      MLFLOW_TRACKING_PASSWORD: admin
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pm_network
+
+  # ─────────────────────────────────────────────
+  # Observability Stack
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: pm_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/rules/:/etc/prometheus/rules/:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: pm_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: admin
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-piechart-panel
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/industrial_overview.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+  node_exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: pm_node_exporter
+    command:
+      - '--path.rootfs=/host'
+    network_mode: host
+    pid: host
+    volumes:
+      - '/:/host:ro,rslave'
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Nginx Reverse Proxy
+  # ─────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: pm_nginx
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - pm_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  mosquitto_data:
+  mosquitto_logs:
+  mlflow_artifacts:
+  model_artifacts:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  pm_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

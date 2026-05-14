@@ -1,0 +1,73 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    platform: "industrial-pm"
+    environment: "production"
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+# Load rules
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+scrape_configs:
+  # Backend API metrics
+  - job_name: "pm_backend"
+    static_configs:
+      - targets: ["backend:8000"]
+    metrics_path: "/metrics"
+    scrape_interval: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "backend-api"
+
+  # Digital twin engine
+  - job_name: "pm_digital_twin"
+    static_configs:
+      - targets: ["digital_twin:8002"]
+    metrics_path: "/metrics"
+    scrape_interval: 10s
+
+  # Streaming engine
+  - job_name: "pm_streaming"
+    static_configs:
+      - targets: ["streaming_engine:8003"]
+    metrics_path: "/metrics"
+    scrape_interval: 10s
+
+  # Celery workers (via Flower)
+  - job_name: "pm_celery"
+    static_configs:
+      - targets: ["flower:5555"]
+    metrics_path: "/metrics"
+    scrape_interval: 30s
+
+  # PostgreSQL
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+    scrape_interval: 30s
+
+  # Redis
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+    scrape_interval: 15s
+
+  # Node exporter (host metrics)
+  - job_name: "node_exporter"
+    static_configs:
+      - targets: ["node_exporter:9100"]
+    scrape_interval: 15s
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
